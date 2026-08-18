@@ -1,5 +1,4 @@
 import streamlit as st
-import threading
 import yt_dlp
 import librosa
 import numpy as np
@@ -19,6 +18,7 @@ import uuid
 import smtplib
 from email.mime.text import MIMEText
 import time
+import threading
 
 # --- SPOTIFY CREDENTIALS SETUP ---
 # Prefer st.secrets (set these in .streamlit/secrets.toml or your host's secrets
@@ -138,7 +138,6 @@ def legacy_hash_password(password):
     were created before salted hashing was added. New accounts never use this."""
     return hashlib.sha256(password.encode()).hexdigest()
 
-import threading
 _db_lock = threading.Lock()
 
 def _read_db_from_disk():
