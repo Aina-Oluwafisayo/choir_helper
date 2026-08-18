@@ -1,5 +1,4 @@
 import streamlit as st
-import threading
 import yt_dlp
 import librosa
 import numpy as np
@@ -286,6 +285,7 @@ def download_by_search_or_link(search_query):
         'outtmpl': output_filename,
         'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'wav', 'preferredquality': '192'}],
         'quiet': True, 'no_warnings': True,
+        'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(final_query, download=True)
