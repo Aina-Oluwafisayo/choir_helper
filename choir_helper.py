@@ -285,7 +285,7 @@ def download_by_search_or_link(search_query):
         'outtmpl': output_filename,
         'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'wav', 'preferredquality': '192'}],
         'quiet': True, 'no_warnings': True,
-        'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
+        'extractor_args': {'youtube': {'player_client': ['web', 'android']}},
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(final_query, download=True)
