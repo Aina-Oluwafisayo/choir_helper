@@ -4,4 +4,4 @@ librosa
 numpy
 spotipy
 pandas
-pymongo[srv]S
+pymongo[srv]
