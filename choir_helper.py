@@ -19,6 +19,7 @@ import smtplib
 from email.mime.text import MIMEText
 import time
 import threading
+import base64
 
 # --- SPOTIFY CREDENTIALS SETUP ---
 # Prefer st.secrets (set these in .streamlit/secrets.toml or your host's secrets
@@ -117,8 +118,21 @@ def send_reset_code_email(to_email, code):
     except Exception as e:
         return False, f"Couldn't send the email: {e}"
 
-# --- PERSISTENT FILE DATABASE ENGINE ---
+# --- PERSISTENT DATABASE ENGINE (MongoDB Atlas if configured, else local file) ---
 DB_FILE = "choir_db.json"
+MONGODB_URI = _get_secret("MONGODB_URI", None)
+USE_MONGO = bool(MONGODB_URI)
+
+_mongo_client = None
+
+def _get_mongo_db():
+    """Lazily creates (once per app process) and returns the MongoDB
+    database handle. Only called when USE_MONGO is True."""
+    global _mongo_client
+    if _mongo_client is None:
+        from pymongo import MongoClient
+        _mongo_client = MongoClient(MONGODB_URI)
+    return _mongo_client["choir_helper"]
 
 def hash_password(password, salt=None):
     """Hashes a password with PBKDF2-HMAC-SHA256 + a per-user random salt.
@@ -141,9 +155,16 @@ def legacy_hash_password(password):
 _db_lock = threading.Lock()
 
 def _read_db_from_disk():
-    """Reads the database file directly from disk with no locking of its
-    own — only call this while holding _db_lock if the result will be
-    written back, otherwise a concurrent writer's change can be lost."""
+    """Reads the current database state — from MongoDB if MONGODB_URI is
+    configured, otherwise from the local JSON file. No locking of its own —
+    only call this while holding _db_lock if the result will be written
+    back, otherwise a concurrent writer's change can be lost."""
+    if USE_MONGO:
+        doc = _get_mongo_db()["app_data"].find_one({"_id": "main"})
+        if doc:
+            doc.pop("_id", None)
+            return doc
+        return {"churches": {}, "users": {}, "assignments": [], "submissions": []}
     if not os.path.exists(DB_FILE):
         return {"churches": {}, "users": {}, "assignments": [], "submissions": []}
     try:
@@ -153,19 +174,63 @@ def _read_db_from_disk():
         return {"churches": {}, "users": {}, "assignments": [], "submissions": []}
 
 def _write_db_to_disk(data):
-    """Writes the database atomically: to a temp file first, then swaps it
-    into place with os.replace. This means a crash or restart mid-write can
-    never leave choir_db.json half-written/corrupted."""
+    """Writes the database — to MongoDB if configured (a single-document
+    replace, atomic on MongoDB's side), otherwise to the local JSON file
+    atomically (temp file + os.replace, so a crash mid-write can never
+    leave choir_db.json half-written/corrupted)."""
+    if USE_MONGO:
+        to_save = dict(data)
+        to_save["_id"] = "main"
+        _get_mongo_db()["app_data"].replace_one({"_id": "main"}, to_save, upsert=True)
+        return
     tmp_path = f"{DB_FILE}.tmp"
     with open(tmp_path, "w") as f:
         json.dump(data, f, indent=4)
     os.replace(tmp_path, DB_FILE)
+
+def save_audio_blob(blob_id, file_bytes):
+    """Permanently stores an audio recording under blob_id. Only meaningful
+    when USE_MONGO is True — when running on local file storage, the caller
+    writes the audio straight to disk instead and this is a no-op."""
+    if USE_MONGO:
+        _get_mongo_db()["audio_blobs"].replace_one(
+            {"_id": blob_id},
+            {"_id": blob_id, "data_b64": base64.b64encode(bytes(file_bytes)).decode("ascii")},
+            upsert=True
+        )
+
+def load_audio_blob(ref):
+    """Loads audio bytes given a reference — a MongoDB blob_id when
+    USE_MONGO is True, or a local file path otherwise. Returns None if not found."""
+    if USE_MONGO:
+        doc = _get_mongo_db()["audio_blobs"].find_one({"_id": ref})
+        return base64.b64decode(doc["data_b64"]) if doc else None
+    if ref and os.path.exists(ref):
+        with open(ref, "rb") as f:
+            return f.read()
+    return None
+
+def delete_audio_blob(ref):
+    """Deletes a stored audio recording given its reference (MongoDB
+    blob_id or local file path, matching whichever mode is active)."""
+    if USE_MONGO:
+        _get_mongo_db()["audio_blobs"].delete_one({"_id": ref})
+    elif ref and os.path.exists(ref):
+        try:
+            os.remove(ref)
+        except Exception:
+            pass  # best-effort cleanup, not worth failing the operation over
 
 def load_permanent_database():
     """Loads multi-tenant data for DISPLAY/READ purposes. Any code that
     WRITES to the database should go through safe_db_update() instead —
     this alone doesn't protect against two users' changes silently
     overwriting one another."""
+    if USE_MONGO:
+        with _db_lock:
+            if not _get_mongo_db()["app_data"].find_one({"_id": "main"}):
+                _write_db_to_disk({"churches": {}, "users": {}, "assignments": [], "submissions": []})
+        return _read_db_from_disk()
     if not os.path.exists(DB_FILE):
         with _db_lock:
             if not os.path.exists(DB_FILE):  # re-check inside the lock
@@ -654,20 +719,37 @@ else:
             uploaded_recording = st.file_uploader("Upload voice part submission (WAV or MP3):", type=["mp3", "wav"])
 
             def _save_submission_file(song, file_obj, remove_ids=None):
-                """Saves a recording to disk + the database. If remove_ids is
-                given, those prior submission records (and their audio files)
-                are removed first so re-recording replaces rather than stacks."""
+                """Saves a recording (to MongoDB if configured, else to local
+                disk) + the database record. If remove_ids is given, those
+                prior submission records (and their audio) are removed first
+                so re-recording replaces rather than stacks."""
                 global db
                 with st.spinner("Processing performance telemetry and backing up data lines..."):
-                    target_dir = f"choir_audio_vault/{user_church_code}"
-                    os.makedirs(target_dir, exist_ok=True)
                     submission_id = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
-                    safe_filename = f"{target_dir}/{current_user['name'].replace(' ', '_')}_{submission_id}.wav"
+                    file_bytes = file_obj.getbuffer()
 
-                    with open(safe_filename, "wb") as f:
-                        f.write(file_obj.getbuffer())
-
-                    ai_note = run_ai_pitch_audit(safe_filename)
+                    if USE_MONGO:
+                        # Analyze from a throwaway temp file (never persisted),
+                        # then store the permanent copy in MongoDB.
+                        temp_path = f"/tmp/choir_temp_{submission_id}.wav"
+                        with open(temp_path, "wb") as f:
+                            f.write(file_bytes)
+                        ai_note = run_ai_pitch_audit(temp_path)
+                        save_audio_blob(submission_id, file_bytes)
+                        if os.path.exists(temp_path):
+                            try:
+                                os.remove(temp_path)
+                            except Exception:
+                                pass
+                        audio_ref = submission_id
+                    else:
+                        target_dir = f"choir_audio_vault/{user_church_code}"
+                        os.makedirs(target_dir, exist_ok=True)
+                        safe_filename = f"{target_dir}/{current_user['name'].replace(' ', '_')}_{submission_id}.wav"
+                        with open(safe_filename, "wb") as f:
+                            f.write(file_bytes)
+                        ai_note = run_ai_pitch_audit(safe_filename)
+                        audio_ref = safe_filename
 
                     new_submission = {
                         "id": f"SUB_{submission_id}",
@@ -676,18 +758,15 @@ else:
                         "name": current_user['name'],
                         "part": current_user['part'],
                         "song": song,
-                        "audio_path": safe_filename,
+                        "audio_path": audio_ref,
                         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
                         "ai_detected_note": ai_note
                     }
 
                     if remove_ids:
                         for s in db.get("submissions", []):
-                            if s.get("id") in remove_ids and os.path.exists(s.get("audio_path", "")):
-                                try:
-                                    os.remove(s["audio_path"])
-                                except Exception:
-                                    pass  # best-effort cleanup, not worth failing the submission over
+                            if s.get("id") in remove_ids:
+                                delete_audio_blob(s.get("audio_path", ""))
 
                     def _mutate(fresh, entry=new_submission, rm=remove_ids):
                         if rm:
@@ -819,9 +898,11 @@ else:
                 ai_pitch = sub_to_audit.get("ai_detected_note", "No Scan Saved")
                 st.metric(label="AI Frequency Engine Analysis Note Output", value=f"Note: {ai_pitch}")
                 
-                if os.path.exists(sub_to_audit["audio_path"]):
-                    with open(sub_to_audit["audio_path"], "rb") as audio_file:
-                        st.audio(audio_file.read(), format="audio/wav")
+                playback_bytes = load_audio_blob(sub_to_audit.get("audio_path"))
+                if playback_bytes:
+                    st.audio(playback_bytes, format="audio/wav")
+                else:
+                    st.warning("Audio recording not found — it may have been removed.")
                 
                 current_eval = sub_to_audit.get("evaluation", {})
                 eval_status = st.radio("Review Audit Checklist Status:", ["Approved ✅", "Needs Re-Recording ❌"], index=0 if "Approved" in current_eval.get("status", "Approved") else 1)
